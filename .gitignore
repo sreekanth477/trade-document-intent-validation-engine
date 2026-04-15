@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.npm
+
+# Environment files — NEVER commit these
+backend/.env
+frontend/.env
+*.env
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build output
+frontend/dist/
+frontend/build/
+
+# Uploads (contains customer documents)
+uploads/
+backend/uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# Temp / test artifacts
+/tmp/
+*.tmp

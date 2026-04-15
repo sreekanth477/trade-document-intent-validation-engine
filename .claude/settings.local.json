@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python __TRACKED_VAR__/scripts/office/unpack.py C:/Users/2318778/Downloads/Trade_Document_Intent_Validation_PRD.docx /tmp/prd_unpacked/)",
+      "Bash(pandoc \"C:/Users/2318778/Downloads/Trade_Document_Intent_Validation_PRD.docx\" -t markdown)",
+      "Bash(python -c ':*)",
+      "Bash(node -e ':*)",
+      "Bash(claude plugin:*)",
+      "Bash(where claude:*)",
+      "Read(//c/Users/2318778/AppData/Local/AnthropicClaude/**)",
+      "Read(//c/Users/2318778/AppData/Roaming/Claude/**)",
+      "Read(//c/Users/2318778/.claude/**)",
+      "Bash(\"C:/Users/2318778/AppData/Roaming/Claude/claude-code/2.1.101/claude.exe\" plugin:*)",
+      "Bash(git --version)",
+      "Bash(curl --version)"
+    ]
+  }
+}
