@@ -14,6 +14,8 @@ const fs          = require('fs');
 const logger                          = require('./utils/logger');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { healthCheck: dbHealthCheck }  = require('./db/connection');
+const correlationId   = require('./middleware/correlationId');
+const requestLogger   = require('./middleware/requestLogger');
 
 // Route modules
 const authRoutes       = require('./routes/auth');
@@ -81,6 +83,11 @@ app.use(cors({
 app.use(compression({ level: 6, threshold: 1024 }));
 
 // ---------------------------------------------------------------------------
+// Correlation ID (must be before requestLogger and routes)
+// ---------------------------------------------------------------------------
+app.use(correlationId);
+
+// ---------------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------------
 const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) || 900000; // 15 min
@@ -115,6 +122,11 @@ app.use('/api/auth/login', authLimiter);
 // ---------------------------------------------------------------------------
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+// ---------------------------------------------------------------------------
+// Request logger (child logger per-request; registered after correlationId)
+// ---------------------------------------------------------------------------
+app.use(requestLogger);
 
 // ---------------------------------------------------------------------------
 // Request logging middleware

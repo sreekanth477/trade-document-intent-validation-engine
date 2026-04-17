@@ -148,4 +148,19 @@ export async function exportAuditTrail(presentationId: string): Promise<Blob> {
   return data;
 }
 
+// ─── SSE progress stream ──────────────────────────────────────────────────────
+
+/**
+ * Returns the SSE stream URL for real-time validation progress.
+ * Use with the EventSource API — SSE doesn't support Authorization headers,
+ * so the token is passed as a query param (handled by backend middleware).
+ *
+ * Note: the backend `authenticate` middleware should be updated to also check
+ * `req.query.token` for SSE connections, in addition to the Authorization header.
+ */
+export function getProgressStreamUrl(presentationId: string): string {
+  const token = localStorage.getItem('auth_token') ?? '';
+  return `/api/validations/${presentationId}/progress?token=${encodeURIComponent(token)}`;
+}
+
 export default apiClient;

@@ -6,7 +6,7 @@ const { z }   = require('zod');
 const { authenticate, authorize }   = require('../middleware/auth');
 const { asyncHandler, createError } = require('../middleware/errorHandler');
 const { query, withTransaction }    = require('../db/connection');
-const { enqueueIntentAnalysis }     = require('../services/queueService');
+const { enqueueIntentAnalysis, getDocumentExtractionQueue, getIntentAnalysisQueue } = require('../services/queueService');
 const { AuditService, EVENT_TYPES } = require('../services/auditService');
 const logger = require('../utils/logger');
 
@@ -401,5 +401,78 @@ router.get(
     });
   })
 );
+
+// ---------------------------------------------------------------------------
+// GET /api/validations/:presentationId/progress
+// Server-Sent Events stream for real-time validation progress.
+// The client connects once and receives events as they happen.
+// ---------------------------------------------------------------------------
+router.get('/:presentationId/progress', authenticate, asyncHandler(async (req, res) => {
+  const { presentationId } = req.params;
+
+  // Set SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    if (!res.writableEnded) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
+  };
+
+  // Send current status immediately on connect
+  const { rows } = await query(
+    `SELECT status, overall_risk_score, stp_candidate, updated_at FROM lc_presentations WHERE id = $1`,
+    [presentationId]
+  );
+  if (rows.length > 0) {
+    send('status', { presentationId, ...rows[0] });
+  }
+
+  // Poll DB every 2 seconds and push updates (simpler than Bull event subscription)
+  let lastStatus = rows[0]?.status;
+  const interval = setInterval(async () => {
+    try {
+      const { rows: current } = await query(
+        `SELECT p.status, p.overall_risk_score, p.stp_candidate,
+                COUNT(d.id) FILTER (WHERE d.extraction_status = 'completed') AS docs_completed,
+                COUNT(d.id) AS docs_total
+         FROM lc_presentations p
+         LEFT JOIN documents d ON d.presentation_id = p.id
+         WHERE p.id = $1
+         GROUP BY p.id`,
+        [presentationId]
+      );
+      if (current.length === 0) return;
+      const row = current[0];
+      send('progress', {
+        presentationId,
+        status: row.status,
+        overallRiskScore: row.overall_risk_score,
+        stpCandidate: row.stp_candidate,
+        docsCompleted: parseInt(row.docs_completed, 10),
+        docsTotal: parseInt(row.docs_total, 10),
+      });
+      // Once completed or failed, send final event and close
+      if (row.status === 'completed' || row.status === 'failed') {
+        send('done', { presentationId, status: row.status });
+        clearInterval(interval);
+        res.end();
+      }
+      lastStatus = row.status;
+    } catch (err) {
+      logger.error('SSE: error polling status', { presentationId, error: err.message });
+    }
+  }, 2000);
+
+  // Clean up when client disconnects
+  req.on('close', () => {
+    clearInterval(interval);
+    if (!res.writableEnded) res.end();
+  });
+}));
 
 module.exports = router;

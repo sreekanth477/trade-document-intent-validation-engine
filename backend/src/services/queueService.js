@@ -269,31 +269,52 @@ function _attachIntentAnalysisHandlers(queue) {
 }
 
 async function _checkAndTriggerAnalysis(presentationId) {
-  // Count documents that are still pending or processing
-  const countResult = await query(
-    `SELECT
-       COUNT(*) FILTER (WHERE extraction_status NOT IN ('completed', 'failed')) AS pending_count,
-       COUNT(*) FILTER (WHERE extraction_status = 'completed') AS completed_count,
-       COUNT(*) FILTER (WHERE document_type IN ('lc', 'invoice', 'bl', 'insurance')) AS required_count,
-       COUNT(*) FILTER (WHERE document_type IN ('lc', 'invoice', 'bl', 'insurance') AND extraction_status = 'completed') AS required_completed_count
-     FROM documents
-     WHERE presentation_id = $1`,
-    [presentationId]
-  );
+  // Use pg advisory lock to prevent race condition when multiple extraction
+  // jobs complete simultaneously and both try to trigger analysis
+  const { getClient } = require('../db/connection');
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    // hashtext() produces a stable integer from the UUID string
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [presentationId]);
 
-  const { pending_count, required_completed_count, required_count } = countResult.rows[0];
+    const countResult = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE extraction_status NOT IN ('completed', 'failed')) AS pending_count,
+         COUNT(*) FILTER (WHERE document_type IN ('lc', 'invoice', 'bl', 'insurance') AND extraction_status = 'completed') AS required_completed_count,
+         COUNT(*) FILTER (WHERE document_type IN ('lc', 'invoice', 'bl', 'insurance')) AS required_count
+       FROM documents
+       WHERE presentation_id = $1`,
+      [presentationId]
+    );
 
-  logger.info('QueueService: checking analysis trigger', {
-    presentationId,
-    pendingCount: pending_count,
-    requiredCompleted: required_completed_count,
-    requiredCount: required_count,
-  });
+    const { pending_count, required_completed_count } = countResult.rows[0];
 
-  // Trigger analysis only when all required doc types are extracted
-  if (parseInt(pending_count, 10) === 0 && parseInt(required_completed_count, 10) >= 2) {
-    logger.info('QueueService: all documents extracted, triggering intent analysis', { presentationId });
-    await enqueueIntentAnalysis(presentationId);
+    logger.info('QueueService: checking analysis trigger', {
+      presentationId,
+      pendingCount: parseInt(pending_count, 10),
+      requiredCompleted: parseInt(required_completed_count, 10),
+    });
+
+    if (parseInt(pending_count, 10) === 0 && parseInt(required_completed_count, 10) >= 2) {
+      // Check if analysis job already queued/running to prevent duplicates
+      const queue = getIntentAnalysisQueue();
+      const existingJob = await queue.getJob(`analysis-${presentationId}`);
+      if (!existingJob) {
+        logger.info('QueueService: triggering intent analysis', { presentationId });
+        await enqueueIntentAnalysis(presentationId);
+      } else {
+        logger.info('QueueService: analysis already queued, skipping', { presentationId });
+      }
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('QueueService: error in _checkAndTriggerAnalysis', { presentationId, error: err.message });
+    throw err;
+  } finally {
+    client.release();
   }
 }
 

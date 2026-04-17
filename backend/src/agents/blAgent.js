@@ -181,6 +181,17 @@ class BLAgent {
       if (!textContent) {
         throw new Error('BLAgent: model returned no text content');
       }
+
+      if (response.usage) {
+        logger.info(`${this.constructor.name}: token usage`, {
+          documentId,
+          inputTokens:       response.usage.input_tokens,
+          outputTokens:      response.usage.output_tokens,
+          cacheReadTokens:   response.usage.cache_read_input_tokens || 0,
+          cacheCreateTokens: response.usage.cache_creation_input_tokens || 0,
+        });
+      }
+
       rawJson = textContent.text.trim();
     }
 
@@ -189,9 +200,26 @@ class BLAgent {
     let parsed;
     try {
       parsed = JSON.parse(rawJson);
-    } catch (parseErr) {
-      logger.error('BLAgent: JSON parse failure', { documentId, raw: rawJson.slice(0, 500) });
-      throw new Error(`BLAgent: could not parse model response as JSON: ${parseErr.message}`);
+    } catch (firstErr) {
+      logger.warn(`${this.constructor.name}: first JSON parse failed, attempting recovery`, { documentId });
+      try {
+        const recovery = await this.client.messages.create({
+          model: this.model,
+          max_tokens: 4096,
+          messages: [
+            { role: 'user', content: userMessage },
+            { role: 'assistant', content: rawJson },
+            { role: 'user', content: 'Your previous response was not valid JSON. Return ONLY the corrected JSON object with no markdown, no explanation, no code fences.' },
+          ],
+        });
+        const recoveryText = recovery.content.find(c => c.type === 'text')?.text?.trim() || '';
+        const cleaned = recoveryText.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+        parsed = JSON.parse(cleaned);
+        logger.info(`${this.constructor.name}: recovery parse succeeded`, { documentId });
+      } catch (recoveryErr) {
+        logger.error(`${this.constructor.name}: JSON parse failure after recovery attempt`, { documentId, raw: rawJson.slice(0, 500) });
+        throw new Error(`${this.constructor.name}: could not parse model response as JSON: ${firstErr.message}`);
+      }
     }
 
     const normalised = this.mapToStandardSchema(parsed, documentId);

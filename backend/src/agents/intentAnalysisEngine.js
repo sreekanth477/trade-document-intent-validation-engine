@@ -4,6 +4,65 @@ const Anthropic = require('@anthropic-ai/sdk');
 const logger    = require('../utils/logger');
 
 // ---------------------------------------------------------------------------
+// Tool definition for structured output via Anthropic Tool Use API
+// ---------------------------------------------------------------------------
+const RECORD_FINDINGS_TOOL = {
+  name: 'record_findings',
+  description: 'Record all cross-document validation findings after completing the full 6-dimension analysis. Call this ONCE after reasoning through all dimensions.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      findings: {
+        type: 'array',
+        description: 'List of all validation findings discovered across the 6 dimensions',
+        items: {
+          type: 'object',
+          properties: {
+            findingType:       { type: 'string', description: 'One of the defined FINDING_TYPES constants' },
+            severity:          { type: 'string', enum: ['critical', 'moderate', 'informational'] },
+            title:             { type: 'string', description: 'Short, clear title of the discrepancy' },
+            description:       { type: 'string', description: 'Detailed description of what was found and why it matters' },
+            affectedDocuments: { type: 'array', items: { type: 'string', enum: ['lc', 'invoice', 'bl', 'insurance'] } },
+            affectedFields:    { type: 'array', items: { type: 'string' } },
+            verbatimQuotes: {
+              type: 'array',
+              description: 'MANDATORY: exact text from source documents proving this finding',
+              items: {
+                type: 'object',
+                properties: {
+                  document: { type: 'string', enum: ['lc', 'invoice', 'bl', 'insurance', 'meta'] },
+                  field:    { type: 'string' },
+                  text:     { type: 'string', description: 'Exact verbatim text from the document' },
+                },
+                required: ['document', 'field', 'text'],
+              },
+            },
+            reasoning:         { type: 'string', description: 'Explanation of the reasoning behind this finding' },
+            confidence:        { type: 'number', minimum: 0, maximum: 100 },
+            ucpArticles:       { type: 'array', items: { type: 'string' }, description: 'Relevant UCP 600 articles e.g. ["Art. 14(d)", "Art. 18"]' },
+            recommendedAction: { type: 'string' },
+          },
+          required: ['findingType', 'severity', 'title', 'description', 'affectedDocuments', 'verbatimQuotes', 'confidence', 'ucpArticles', 'recommendedAction'],
+        },
+      },
+      dimensionSummary: {
+        type: 'object',
+        properties: {
+          commercialCoherence:  { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+          partyResolution:      { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+          logisticsFeasibility: { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+          coverageAlignment:    { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+          temporalCoherence:    { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+          tradePatternAnomaly:  { type: 'object', properties: { status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, findingCount: { type: 'number' } }, required: ['status', 'findingCount'] },
+        },
+        required: ['commercialCoherence', 'partyResolution', 'logisticsFeasibility', 'coverageAlignment', 'temporalCoherence', 'tradePatternAnomaly'],
+      },
+    },
+    required: ['findings', 'dimensionSummary'],
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Intent Analysis Engine
 // The core cross-document reasoning agent. Takes structured JSON from all 4
 // extraction agents and reasons through 6 validation dimensions to produce
@@ -109,6 +168,14 @@ Examine whether all dates form a logically and legally compliant timeline.
 - Are any dates suspicious (e.g., weekend dates for banking documents, dates in the future)?
 - Are dates internally consistent within each document?
 
+PRESENTATION PERIOD DEADLINE CHECK (MANDATORY):
+The input includes meta.submissionDate (today's date) and meta.presentationDeadline (onBoardDate + 21 days).
+If meta.presentationDeadline is not null and meta.submissionDate > meta.presentationDeadline, raise a CRITICAL finding:
+- findingType: "PRESENTATION_PERIOD_EXCEEDED"
+- title: "Documents Presented Outside 21-Day Presentation Period"
+- ucpArticles: ["Art. 14(c)"]
+- verbatimQuotes: include the onBoardDate from the BL and the submissionDate from meta
+
 DIMENSION 6 — TRADE PATTERN ANOMALY
 Examine the overall trade for statistically unusual or potentially suspicious patterns.
 - Is the trade route commercially logical (are origin and destination countries consistent with stated goods)?
@@ -122,43 +189,16 @@ Examine the overall trade for statistically unusual or potentially suspicious pa
 - Are insurance and BL ports consistent, or does the insurance cover a different route?
 
 ════════════════════════════════════════════════════════
-OUTPUT FORMAT
+REPORTING INSTRUCTIONS
 ════════════════════════════════════════════════════════
 
-After completing all dimension analyses, output:
+After completing ALL six dimension analyses above, call the record_findings tool ONCE with:
+1. findings: every discrepancy you identified, each with mandatory verbatimQuotes
+2. dimensionSummary: pass/fail/warning for each of the 6 dimensions
 
-FINDINGS_JSON_START
-{
-  "findings": [
-    {
-      "findingType": string,
-      "severity": "critical" | "moderate" | "informational",
-      "title": string,
-      "description": string,
-      "affectedDocuments": [string],
-      "affectedFields": [string],
-      "verbatimQuotes": [
-        { "document": string, "field": string, "text": string }
-      ],
-      "reasoning": string,
-      "confidence": number,
-      "ucpArticles": [string],
-      "recommendedAction": string
-    }
-  ],
-  "dimensionSummary": {
-    "commercialCoherence": { "status": "pass" | "fail" | "warning", "findingCount": number },
-    "partyResolution": { "status": "pass" | "fail" | "warning", "findingCount": number },
-    "logisticsFeasibility": { "status": "pass" | "fail" | "warning", "findingCount": number },
-    "coverageAlignment": { "status": "pass" | "fail" | "warning", "findingCount": number },
-    "temporalCoherence": { "status": "pass" | "fail" | "warning", "findingCount": number },
-    "tradePatternAnomaly": { "status": "pass" | "fail" | "warning", "findingCount": number }
-  }
-}
-FINDINGS_JSON_END
-
-If there are no findings in a dimension, do not include empty findings. A clean dimension should be noted in your reasoning but produces no findings.
-The JSON between FINDINGS_JSON_START and FINDINGS_JSON_END must be valid JSON parseable by JSON.parse().`;
+Do NOT call record_findings before completing all dimensions.
+Do NOT call record_findings more than once.
+A finding with empty verbatimQuotes will be discarded — always cite exact source text.`;
 
 // ---------------------------------------------------------------------------
 // Finding type constants
@@ -199,52 +239,108 @@ class IntentAnalysisEngine {
    * @param {object} blData        - Normalised output from BLAgent
    * @param {object} insuranceData - Normalised output from InsuranceAgent
    * @param {string} presentationId - UUID for logging
+   * @param {object} meta          - Presentation deadline metadata
    * @returns {Promise<object>} - { findings, dimensionSummary, rawReasoning }
    */
-  async analyze(lcData, invoiceData, blData, insuranceData, presentationId) {
+  async analyze(lcData, invoiceData, blData, insuranceData, presentationId, meta = {}) {
     logger.info('IntentAnalysisEngine: starting cross-document analysis', { presentationId });
 
     // Build the structured input payload for the model
-    const inputPayload = this._buildInputPayload(lcData, invoiceData, blData, insuranceData);
+    const inputPayload = this._buildInputPayload(lcData, invoiceData, blData, insuranceData, meta);
 
-    const userMessage = `Perform a complete cross-document validation analysis on the following extracted trade document data. Work through all 6 dimensions step by step before outputting the FINDINGS_JSON block.
+    const userMessage = `Perform a complete cross-document validation analysis on the following extracted trade document data. Work through all 6 dimensions step by step, then call the record_findings tool.
 
 EXTRACTED DOCUMENT DATA:
 ${JSON.stringify(inputPayload, null, 2)}`;
 
     let modelResponse;
+    let rawReasoning = '';
 
     if (process.env.USE_MOCK_LLM === 'true') {
       modelResponse = this._getMockAnalysis(lcData, invoiceData, blData, insuranceData);
-    } else {
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 8192,
-        system: [
-          {
-            type: 'text',
-            text: INTENT_ANALYSIS_SYSTEM_PROMPT,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-        messages: [{ role: 'user', content: userMessage }],
-      });
-
-      const textContent = response.content.find(c => c.type === 'text');
-      if (!textContent) {
-        throw new Error('IntentAnalysisEngine: model returned no text content');
-      }
-      modelResponse = textContent.text;
+      // In mock mode, fall through to the text-based parsing below
+      const startIdx = modelResponse.indexOf('FINDINGS_JSON_START');
+      rawReasoning = startIdx > -1 ? modelResponse.substring(0, startIdx).trim() : modelResponse;
+      const parsed = this._extractAndParseFindings(modelResponse, presentationId);
+      logger.info('IntentAnalysisEngine: analysis complete (mock)', { presentationId, findingCount: parsed.findings.length });
+      return {
+        findings:         parsed.findings,
+        dimensionSummary: parsed.dimensionSummary,
+        rawReasoning,
+        analyzedAt:       new Date().toISOString(),
+      };
     }
 
-    // Parse the JSON block from between the sentinel markers
-    const parsed = this._extractAndParseFindings(modelResponse, presentationId);
+    const response = await this.client.messages.create({
+      model: this.model,
+      max_tokens: 16000,
+      thinking: {
+        type: 'enabled',
+        budget_tokens: 8000,
+      },
+      tools: [RECORD_FINDINGS_TOOL],
+      tool_choice: { type: 'any' }, // force the model to call record_findings
+      system: [
+        {
+          type: 'text',
+          text: INTENT_ANALYSIS_SYSTEM_PROMPT,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: userMessage }],
+    });
 
-    // Extract the chain-of-thought reasoning (everything before FINDINGS_JSON_START)
-    const startIdx = modelResponse.indexOf('FINDINGS_JSON_START');
-    const rawReasoning = startIdx > -1
-      ? modelResponse.substring(0, startIdx).trim()
-      : modelResponse;
+    // Extract thinking blocks for audit trail
+    const thinkingBlocks = response.content.filter(b => b.type === 'thinking');
+    rawReasoning = thinkingBlocks.map(b => b.thinking).join('\n\n---\n\n');
+
+    // Extract tool use result — structured and schema-validated by the API
+    const toolUseBlock = response.content.find(b => b.type === 'tool_use' && b.name === 'record_findings');
+    if (!toolUseBlock) {
+      // Fallback: try text content parsing if tool use not triggered
+      const textBlock = response.content.find(b => b.type === 'text');
+      logger.warn('IntentAnalysisEngine: tool_use not found, attempting text fallback', { presentationId });
+      modelResponse = textBlock?.text || '';
+      const parsed = this._extractAndParseFindings(modelResponse, presentationId);
+      return {
+        findings:         parsed.findings,
+        dimensionSummary: parsed.dimensionSummary,
+        rawReasoning,
+        analyzedAt:       new Date().toISOString(),
+      };
+    }
+
+    // Tool use succeeded — input is already a validated JS object
+    const parsed = {
+      findings: toolUseBlock.input.findings || [],
+      dimensionSummary: toolUseBlock.input.dimensionSummary || {},
+    };
+
+    // Log token usage
+    if (response.usage) {
+      logger.info('IntentAnalysisEngine: token usage', {
+        presentationId,
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cacheReadTokens: response.usage.cache_read_input_tokens || 0,
+        thinkingTokens: response.usage.thinking_tokens || 0,
+      });
+    }
+
+    // Normalise findings (same validation as before)
+    parsed.findings = parsed.findings.map((f) => ({
+      findingType:       f.findingType || 'UNKNOWN',
+      severity:          this._normaliseSeverity(f.severity),
+      title:             f.title || 'Unnamed Finding',
+      description:       f.description || '',
+      affectedDocuments: Array.isArray(f.affectedDocuments) ? f.affectedDocuments : [],
+      affectedFields:    Array.isArray(f.affectedFields) ? f.affectedFields : [],
+      verbatimQuotes:    Array.isArray(f.verbatimQuotes) ? f.verbatimQuotes.map(q => ({ document: q.document || '', field: q.field || '', text: q.text || '' })) : [],
+      reasoning:         f.reasoning || '',
+      confidence:        Math.min(100, Math.max(0, parseInt(f.confidence, 10) || 50)),
+      ucpArticles:       Array.isArray(f.ucpArticles) ? f.ucpArticles : [],
+      recommendedAction: f.recommendedAction || '',
+    }));
 
     logger.info('IntentAnalysisEngine: analysis complete', {
       presentationId,
@@ -252,10 +348,10 @@ ${JSON.stringify(inputPayload, null, 2)}`;
     });
 
     return {
-      findings:         parsed.findings,
+      findings: parsed.findings,
       dimensionSummary: parsed.dimensionSummary,
       rawReasoning,
-      analyzedAt:       new Date().toISOString(),
+      analyzedAt: new Date().toISOString(),
     };
   }
 
@@ -263,7 +359,7 @@ ${JSON.stringify(inputPayload, null, 2)}`;
    * Build a clean, compact input payload for the model.
    * Flattens each document's fields for easier model consumption.
    */
-  _buildInputPayload(lcData, invoiceData, blData, insuranceData) {
+  _buildInputPayload(lcData, invoiceData, blData, insuranceData, meta = {}) {
     const flattenDoc = (data) => {
       if (!data || !data.fields) return {};
       const out = {};
@@ -289,6 +385,13 @@ ${JSON.stringify(inputPayload, null, 2)}`;
       invoice:   invoiceData   ? { overallConfidence: invoiceData.overallConfidence,   fields: flattenDoc(invoiceData) }   : null,
       bl:        blData        ? { overallConfidence: blData.overallConfidence,         fields: flattenDoc(blData) }         : null,
       insurance: insuranceData ? { overallConfidence: insuranceData.overallConfidence, fields: flattenDoc(insuranceData) } : null,
+      meta: {
+        submissionDate:      meta.submissionDate      || null,
+        presentationDeadline: meta.presentationDeadline || null,
+        onBoardDate:         meta.onBoardDate         || null,
+        lcExpiryDate:        meta.lcExpiryDate        || null,
+        latestShipmentDate:  meta.latestShipmentDate  || null,
+      },
     };
   }
 

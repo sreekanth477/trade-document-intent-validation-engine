@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -23,6 +23,46 @@ import DiscrepancyReport from '../components/DiscrepancyReport';
 import type { Finding, Severity, OverrideData } from '../types';
 
 const SEVERITY_ORDER: Severity[] = ['critical', 'moderate', 'informational'];
+
+/**
+ * Connect to the SSE progress stream for a presentation.
+ * Invalidates the React Query cache on every progress event.
+ * Closes the connection once status is completed or failed.
+ */
+function useProgressSSE(presentationId: string | undefined, enabled: boolean) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!presentationId || !enabled) return;
+
+    const token = localStorage.getItem('auth_token');
+    // SSE doesn't support headers natively — pass token as query param
+    const url = `/api/validations/${presentationId}/progress?token=${token ?? ''}`;
+    const es = new EventSource(url);
+
+    es.addEventListener('progress', () => {
+      queryClient.invalidateQueries({ queryKey: ['presentation', presentationId] });
+    });
+
+    es.addEventListener('status', () => {
+      queryClient.invalidateQueries({ queryKey: ['presentation', presentationId] });
+    });
+
+    es.addEventListener('done', () => {
+      queryClient.invalidateQueries({ queryKey: ['presentation', presentationId] });
+      es.close();
+    });
+
+    es.onerror = () => {
+      // On SSE error, fall back gracefully — React Query will continue with its own refetch
+      es.close();
+    };
+
+    return () => {
+      es.close();
+    };
+  }, [presentationId, enabled, queryClient]);
+}
 
 function RiskBadge({ score }: { score: number }) {
   const color =
@@ -57,10 +97,8 @@ export default function ReviewScreen() {
     queryKey: ['presentation', presentationId],
     queryFn: () => getPresentation(presentationId!),
     enabled: !!presentationId,
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return status === 'processing' || status === 'pending' ? 5000 : false;
-    },
+    refetchInterval: false,
+    refetchOnWindowFocus: true,
   });
 
   const overrideMutation = useMutation({
@@ -133,6 +171,8 @@ export default function ReviewScreen() {
   const isProcessing =
     presentation.status === 'processing' || presentation.status === 'pending';
 
+  useProgressSSE(presentationId, isProcessing);
+
   return (
     <>
       {/* Print-only report */}
@@ -174,6 +214,15 @@ export default function ReviewScreen() {
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-100 px-3 py-1 text-sm font-medium text-blue-700">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   Analysing…
+                </span>
+              )}
+              {isProcessing && (
+                <span className="flex items-center gap-1 text-xs text-green-600">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                  </span>
+                  Live
                 </span>
               )}
             </div>

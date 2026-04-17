@@ -87,7 +87,7 @@ const FINDING_TYPE_WEIGHTS = {
 
 // STP disqualifying conditions
 const STP_DISQUALIFYING_SEVERITIES = new Set(['critical']);
-const STP_MAX_MODERATE_FINDINGS = 2;
+const STP_MAX_MODERATE_FINDINGS = 0; // PRD: "no Critical or Moderate findings" for STP
 const STP_MAX_OVERALL_SCORE = 25;
 
 class RiskClassifier {
@@ -165,10 +165,11 @@ class RiskClassifier {
     }
 
     // Determine STP eligibility
+    // PRD: STP requires "no Critical or Moderate findings" — any moderate finding disqualifies
     const hasCritical   = counts.critical > 0;
-    const tooManyMod    = counts.moderate > STP_MAX_MODERATE_FINDINGS;
+    const hasModerate   = counts.moderate > STP_MAX_MODERATE_FINDINGS;
     const scoreTooHigh  = overallScore > STP_MAX_OVERALL_SCORE;
-    const stpCandidate  = !hasCritical && !tooManyMod && !scoreTooHigh;
+    const stpCandidate  = !hasCritical && !hasModerate && !scoreTooHigh;
 
     // Determine risk band
     let riskBand;
@@ -303,7 +304,19 @@ class RiskClassifier {
       return `Risk Band: ${riskBand} (Score: ${overallScore}/100). No findings detected. ${stpCandidate ? 'Eligible for straight-through processing.' : 'Not eligible for STP.'}`;
     }
 
-    const summary = `Risk Band: ${riskBand} (Score: ${overallScore}/100). ${parts.join('. ')}. ${stpCandidate ? 'Eligible for straight-through processing.' : 'Manual checker review required.'}`;
+    // Determine the precise STP ineligibility reason for the summary
+    let stpSuffix;
+    if (stpCandidate) {
+      stpSuffix = 'Eligible for straight-through processing.';
+    } else if (counts.critical > 0) {
+      stpSuffix = 'Not STP eligible: critical findings present. Manual checker review required.';
+    } else if (counts.moderate > 0) {
+      stpSuffix = 'Not STP eligible: moderate findings present. Manual checker review required.';
+    } else {
+      stpSuffix = 'Not STP eligible: risk score too high. Manual checker review required.';
+    }
+
+    const summary = `Risk Band: ${riskBand} (Score: ${overallScore}/100). ${parts.join('. ')}. ${stpSuffix}`;
     return summary;
   }
 }

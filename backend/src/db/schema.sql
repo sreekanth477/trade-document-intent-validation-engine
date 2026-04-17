@@ -129,6 +129,12 @@ CREATE INDEX IF NOT EXISTS idx_findings_status           ON findings (status);
 CREATE INDEX IF NOT EXISTS idx_findings_finding_type     ON findings (finding_type);
 CREATE INDEX IF NOT EXISTS idx_findings_verbatim_quotes  ON findings USING GIN (verbatim_quotes);
 
+-- Prevent duplicate findings for same presentation and finding type
+-- (affected_fields cast to text for comparability)
+-- migration_002_dedup: add this index to existing deployments via: CREATE UNIQUE INDEX IF NOT EXISTS ...
+CREATE UNIQUE INDEX IF NOT EXISTS findings_dedup_idx
+  ON findings (presentation_id, finding_type, (affected_fields::text));
+
 -- ============================================================
 -- TABLE: overrides
 -- ============================================================

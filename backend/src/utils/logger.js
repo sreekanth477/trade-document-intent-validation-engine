@@ -96,4 +96,11 @@ logger.httpStream = {
   write: (message) => logger.http(message.trim()),
 };
 
+/**
+ * Create a child logger with bound context fields.
+ * Use this in route handlers and services for structured per-request logging.
+ * @param {object} context - Fields to attach to all log entries (correlationId, userId, etc.)
+ */
+logger.createChild = (context) => logger.child(context);
+
 module.exports = logger;

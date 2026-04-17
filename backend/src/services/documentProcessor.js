@@ -15,6 +15,14 @@ const BLAgent        = require('../agents/blAgent');
 const InsuranceAgent = require('../agents/insuranceAgent');
 const { IntentAnalysisEngine } = require('../agents/intentAnalysisEngine');
 
+// Singleton agents — instantiated once, reused for all requests
+// This ensures Anthropic client connections are pooled and prompt cache is warmed
+const _lcAgent        = new LCAgent();
+const _invoiceAgent   = new InvoiceAgent();
+const _blAgent        = new BLAgent();
+const _insuranceAgent = new InsuranceAgent();
+const _intentEngine   = new IntentAnalysisEngine();
+
 // ---------------------------------------------------------------------------
 // Document Processor
 // Orchestrates the full pipeline for a trade document presentation:
@@ -28,11 +36,13 @@ const { IntentAnalysisEngine } = require('../agents/intentAnalysisEngine');
 
 class DocumentProcessor {
   constructor() {
-    this.lcAgent        = new LCAgent();
-    this.invoiceAgent   = new InvoiceAgent();
-    this.blAgent        = new BLAgent();
-    this.insuranceAgent = new InsuranceAgent();
-    this.intentEngine   = new IntentAnalysisEngine();
+    // Use module-level singletons so Anthropic client connections are pooled
+    // and prompt cache stays warm across requests
+    this.lcAgent        = _lcAgent;
+    this.invoiceAgent   = _invoiceAgent;
+    this.blAgent        = _blAgent;
+    this.insuranceAgent = _insuranceAgent;
+    this.intentEngine   = _intentEngine;
     this.riskClassifier = new RiskClassifier();
   }
 
@@ -144,9 +154,33 @@ class DocumentProcessor {
 
     if (job) job.progress(20);
 
+    // Compute presentation deadline meta
+    const today = new Date().toISOString().split('T')[0];
+
+    // Try to get BL on-board date from blData
+    const onBoardDate = blData?.fields?.onBoardDate?.value || blData?.fields?.blDate?.value || null;
+    const lcExpiryDate = lcData?.fields?.expiryDate?.value || null;
+    const latestShipmentDate = lcData?.fields?.latestShipmentDate?.value || null;
+
+    // UCP Art. 14(c): max 21 calendar days after on-board date, but not beyond LC expiry
+    let presentationDeadline = null;
+    if (onBoardDate && onBoardDate !== 'NOT_FOUND') {
+      const d = new Date(onBoardDate);
+      d.setDate(d.getDate() + 21);
+      presentationDeadline = d.toISOString().split('T')[0];
+    }
+
+    const meta = {
+      submissionDate: today,
+      presentationDeadline,
+      onBoardDate,
+      lcExpiryDate,
+      latestShipmentDate,
+    };
+
     // Run Intent Analysis Engine
     const analysisResult = await this.intentEngine.analyze(
-      lcData, invoiceData, blData, insuranceData, presentationId
+      lcData, invoiceData, blData, insuranceData, presentationId, meta
     );
     if (job) job.progress(60);
 
@@ -221,6 +255,35 @@ class DocumentProcessor {
       riskBand:        overallRisk.riskBand,
       dimensionSummary: analysisResult.dimensionSummary,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Parallel document extraction
+  // -------------------------------------------------------------------------
+
+  /**
+   * Extract all documents in a presentation concurrently.
+   * Uses Promise.allSettled so one failure doesn't abort others.
+   * @param {Array<{id, documentType, filePath}>} documents
+   * @returns {Promise<Array<{documentId, success, data, error}>>}
+   */
+  async extractAllDocuments(documents) {
+    logger.info('DocumentProcessor: starting parallel extraction', {
+      documentCount: documents.length,
+      documentTypes: documents.map(d => d.documentType),
+    });
+
+    const results = await Promise.allSettled(
+      documents.map(doc => this.extractDocument(doc.id, doc.documentType, doc.filePath))
+    );
+
+    return results.map((result, i) => ({
+      documentId:   documents[i].id,
+      documentType: documents[i].documentType,
+      success:      result.status === 'fulfilled',
+      data:         result.status === 'fulfilled' ? result.value : null,
+      error:        result.status === 'rejected'  ? result.reason?.message : null,
+    }));
   }
 
   // -------------------------------------------------------------------------
