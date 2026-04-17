@@ -561,11 +561,416 @@ For the pilot (50 concurrent LC sets), a single backend instance with 10 extract
 
 ---
 
+---
+
+## 16. Design Improvements — v1.1 Review
+
+> This section captures concrete improvements identified through a cross-layer review of the v1.0 implementation. Each improvement is grounded in a specific code-level observation. Improvements are grouped by theme and prioritised P0–P2.
+
+---
+
+### 16.1 Correctness Fixes (P0 — must fix before pilot)
+
+#### Fix 1 — STP Eligibility Bug: Moderate Findings Should Disqualify
+
+**Problem:** `riskClassifier.js` line 90 sets `STP_MAX_MODERATE_FINDINGS = 2`, meaning a presentation with one or two moderate findings is still marked as an STP candidate. The PRD states explicitly:
+
+> *"Clean LC sets (no Critical or Moderate findings) must be flagged as STP candidates."*
+
+A presentation with two moderate findings routed to STP auto-approval is a direct regulatory risk — moderate findings require human checker review by definition.
+
+**Fix:** Change `STP_MAX_MODERATE_FINDINGS` from `2` to `0`. Zero moderate findings is the correct threshold. The scoring gate (`STP_MAX_OVERALL_SCORE = 25`) provides a second check, but the primary gate must be zero moderates.
+
+```javascript
+// riskClassifier.js — corrected
+const STP_MAX_MODERATE_FINDINGS = 0; // PRD: "no Critical or Moderate findings"
+```
+
+**Impact:** Reduces false STP rate; eliminates regulatory exposure from under-reviewed presentations.
+
+---
+
+#### Fix 2 — Presentation Period Deadline Not Calculated
+
+**Problem:** The Intent Analysis Engine's Dimension 5 (Temporal Coherence) checks dates within documents but does not calculate the most operationally important date check: **whether the current submission date falls within the 21-day presentation period after the BL on-board date**.
+
+Under UCP 600 Article 14(c), a nominated bank must present documents no later than 21 calendar days after the date of shipment. The system ingests the BL on-board date from the BL Agent but never computes: `onBoardDate + 21 days ≥ submissionDate`.
+
+**Fix:** Add an explicit presentation deadline check in the Intent Analysis Engine input payload:
+
+```javascript
+// documentProcessor.js — add to the analysis input
+const submissionDate = new Date().toISOString().split('T')[0];
+inputPayload.meta = {
+  submissionDate,
+  presentationDeadline: computePresentationDeadline(blData, lcData),
+};
+```
+
+The Intent Analysis Engine system prompt must be updated to instruct the model to check `meta.presentationDeadline` against `meta.submissionDate` as a mandatory Dimension 5 check.
+
+**Impact:** Catches one of the most common and costly LC discrepancies that the current implementation misses entirely.
+
+---
+
+#### Fix 3 — Duplicate Analysis Trigger Race Condition
+
+**Problem:** `_checkAndTriggerAnalysis()` in `queueService.js` is called by every document extraction job after completion. If two extraction jobs complete nearly simultaneously (possible at high concurrency), both could read `pending_count = 0` before either has enqueued the analysis job, resulting in two intent analysis jobs being enqueued for the same presentation.
+
+Bull's `jobId: \`analysis-${presentationId}\`` option prevents a second job being added if one already exists with that ID, which partially mitigates this — but only if the first job has already been persisted to Redis before the second call. Under heavy load this is not guaranteed.
+
+**Fix:** Add a database-level advisory lock around the trigger check:
+
+```javascript
+async function _checkAndTriggerAnalysis(presentationId) {
+  await query('SELECT pg_advisory_xact_lock(hashtext($1))', [presentationId]);
+  // ... existing check logic inside a transaction
+}
+```
+
+This ensures only one worker triggers analysis per presentation, regardless of concurrency.
+
+**Impact:** Eliminates duplicate analysis runs that would produce duplicate findings in the database.
+
+---
+
+### 16.2 AI / API Improvements (P0–P1)
+
+#### Improvement 1 — Replace Sentinel JSON Parsing with Tool Use (P0)
+
+**Current approach:** The Intent Analysis Engine asks the model to output findings between `FINDINGS_JSON_START` / `FINDINGS_JSON_END` sentinel markers, then parses the text between them. This is fragile — the model can wrap the markers in markdown, shift indentation, or truncate the block at the token limit.
+
+**Improved approach:** Use the Anthropic API's **tool use** (function calling) feature to enforce structured output. Define a `record_findings` tool with the exact JSON schema required. The model calls this tool to submit its findings — no text parsing required.
+
+```javascript
+// intentAnalysisEngine.js — tool use approach
+const response = await this.client.messages.create({
+  model: this.model,
+  max_tokens: 8192,
+  tools: [
+    {
+      name: 'record_findings',
+      description: 'Record all cross-document validation findings after completing analysis',
+      input_schema: {
+        type: 'object',
+        properties: {
+          findings: {
+            type: 'array',
+            items: { /* full finding schema */ }
+          },
+          dimensionSummary: { /* dimension summary schema */ }
+        },
+        required: ['findings', 'dimensionSummary']
+      }
+    }
+  ],
+  tool_choice: { type: 'auto' },
+  messages: [{ role: 'user', content: userMessage }]
+});
+
+// Extract tool use block — no regex, no sentinel parsing
+const toolUseBlock = response.content.find(b => b.type === 'tool_use');
+const findings = toolUseBlock.input; // Already a validated JS object
+```
+
+**Benefits:**
+- Eliminates all JSON parsing failure modes
+- The API validates the schema before returning — malformed outputs are rejected at the API level
+- The model's reasoning text (in preceding `text` content blocks) is still available for the audit trail
+- Removes the `_extractAndParseFindings()` method and its fallback heuristics entirely
+
+**ADR update:** ADR-007 — Tool Use over Sentinel JSON Parsing for all structured AI outputs.
+
+---
+
+#### Improvement 2 — Extended Thinking for Intent Analysis Engine (P1)
+
+**Current approach:** The Intent Analysis Engine uses explicit chain-of-thought prompting via `DIMENSION [N] ANALYSIS:` section headers. This produces reasoning that is visible in the prompt and must be instructed to appear, which means the model may compress or skip reasoning steps when under token pressure.
+
+**Improved approach:** Enable **extended thinking** (`"type": "thinking"`) on the Intent Analysis Engine call. Extended thinking gives the model a private scratchpad that doesn't count against the output token limit, resulting in deeper reasoning without truncation risk.
+
+```javascript
+// intentAnalysisEngine.js — with extended thinking
+const response = await this.client.messages.create({
+  model: 'claude-sonnet-4-6',
+  max_tokens: 16000,
+  thinking: {
+    type: 'enabled',
+    budget_tokens: 8000  // 8k tokens for private reasoning
+  },
+  tools: [/* record_findings tool */],
+  messages: [{ role: 'user', content: userMessage }]
+});
+
+// Separate thinking blocks from tool use / text blocks
+const thinkingBlocks = response.content.filter(b => b.type === 'thinking');
+const toolUseBlock   = response.content.find(b => b.type === 'tool_use');
+
+// Store thinking for audit trail (regulatory chain-of-thought evidence)
+const auditReasoning = thinkingBlocks.map(b => b.thinking).join('\n\n');
+```
+
+**Benefits:**
+- Higher quality cross-document reasoning without explicit prompting for it
+- Reasoning is richer and harder for adversarial documents to manipulate
+- Thinking tokens are stored separately in the audit trail for regulatory evidence
+- Eliminates the need for `DIMENSION [N] ANALYSIS:` instructions in the system prompt
+
+**Constraint:** Extended thinking requires `budget_tokens` to be set carefully. 8,000 thinking tokens at Sonnet pricing adds cost per analysis — evaluate against accuracy improvement on the benchmark corpus before enabling in production.
+
+---
+
+#### Improvement 3 — Prompt Caching for All System Prompts (P1)
+
+**Current approach:** All four document agents and the Intent Analysis Engine already use `cache_control: { type: 'ephemeral' }` on their system prompts. This is correct.
+
+**Gap identified:** The extraction agents create a **new Anthropic client instance per class instantiation** (`new Anthropic(...)` in each constructor). If agents are instantiated per request (which they are via `documentProcessor.js`), the client is recreated every time, defeating connection pooling.
+
+**Fix:** Instantiate agents as **module-level singletons** rather than per-request instances:
+
+```javascript
+// documentProcessor.js — singleton agents
+const lcAgent        = new LCAgent();
+const invoiceAgent   = new InvoiceAgent();
+const blAgent        = new BLAgent();
+const insuranceAgent = new InsuranceAgent();
+const intentEngine   = new IntentAnalysisEngine();
+
+// Reuse across all requests — client connections are pooled
+```
+
+**Additional caching opportunity:** For the extraction agents, the document text is in the user message. For large LC documents (3,000+ tokens), prefix-cache the common instruction preamble in a `user` turn to save tokens on repeated partial documents.
+
+---
+
+#### Improvement 4 — Token Usage Tracking per Presentation (P1)
+
+**Current approach:** API token usage is not tracked. At scale, this makes cost management and per-presentation cost attribution impossible.
+
+**Fix:** The Anthropic API response includes a `usage` object with `input_tokens`, `output_tokens`, and `cache_read_input_tokens`. Log this to the audit trail:
+
+```javascript
+// In each agent after the API call
+const usage = response.usage;
+await AuditService.logEvent(presentationId, 'TOKEN_USAGE', {
+  agentType: 'lc_extraction',
+  inputTokens:       usage.input_tokens,
+  outputTokens:      usage.output_tokens,
+  cacheReadTokens:   usage.cache_read_input_tokens || 0,
+  cacheCreateTokens: usage.cache_creation_input_tokens || 0,
+  estimatedCostUSD:  estimateCost(usage),
+});
+```
+
+**Benefits:** Per-presentation cost attribution; cache hit rate monitoring; cost anomaly alerting; drives the ROI calculation for the business case.
+
+---
+
+### 16.3 Reliability Improvements (P1)
+
+#### Improvement 5 — JSON Parse Retry with Recovery Prompt
+
+**Current approach:** If the model returns malformed JSON (despite instructions), `lcAgent.js` throws immediately with no recovery attempt.
+
+**Fix:** On parse failure, retry once with a recovery prompt that shows the model its own malformed output and asks it to fix it:
+
+```javascript
+// In mapToStandardSchema — after first parse failure
+try {
+  parsed = JSON.parse(rawJson);
+} catch {
+  logger.warn('LCAgent: first parse attempt failed, retrying with recovery prompt');
+  const recovery = await this.client.messages.create({
+    model: this.model,
+    max_tokens: 4096,
+    messages: [
+      { role: 'user', content: userMessage },
+      { role: 'assistant', content: rawJson },
+      { role: 'user', content: 'Your previous response was not valid JSON. Fix it and return only valid JSON, nothing else.' }
+    ]
+  });
+  parsed = JSON.parse(recovery.content[0].text.trim());
+}
+```
+
+This single retry costs one additional API call but eliminates the most common failure mode in production LLM pipelines.
+
+---
+
+#### Improvement 6 — Server-Sent Events (SSE) for Real-Time Progress (P1)
+
+**Current approach:** The `ReviewScreen.tsx` polls `/api/validations/:presentationId` every 3 seconds while a presentation is processing. At 50 concurrent users, this generates 50 × 20 = 1,000 unnecessary DB reads per minute.
+
+**Improved approach:** Replace polling with **Server-Sent Events (SSE)** — a native HTTP streaming mechanism requiring no WebSocket infrastructure.
+
+```javascript
+// Backend: routes/validations.js — new SSE endpoint
+router.get('/:presentationId/progress', authenticate, (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  // Subscribe to Bull queue progress events for this presentation
+  const subscription = queueEvents.on('progress', ({ jobId, data }) => {
+    if (data.presentationId === req.params.presentationId) send('progress', data);
+  });
+
+  req.on('close', () => subscription.off());
+});
+```
+
+```typescript
+// Frontend: ReviewScreen.tsx — SSE hook
+const useProgressStream = (presentationId: string) => {
+  useEffect(() => {
+    const es = new EventSource(`/api/validations/${presentationId}/progress`);
+    es.addEventListener('progress', (e) => queryClient.invalidateQueries(['presentation', presentationId]));
+    return () => es.close();
+  }, [presentationId]);
+};
+```
+
+**Benefits:** Eliminates 1,000 unnecessary requests/minute at 50 concurrent users; zero latency between job completion and UI update; simpler than WebSockets; native browser support.
+
+---
+
+#### Improvement 7 — Correlation IDs Across the Full Request Chain (P1)
+
+**Current approach:** Each layer (HTTP request, queue job, agent call, DB write) uses its own IDs (`documentId`, `presentationId`, `jobId`) but there is no single `correlationId` that traces one user request across all layers.
+
+**Fix:** Generate a `correlationId` (UUID) at the HTTP request boundary and thread it through every downstream call:
+
+```javascript
+// middleware/correlationId.js
+const { v4: uuidv4 } = require('uuid');
+module.exports = (req, res, next) => {
+  req.correlationId = req.headers['x-correlation-id'] || uuidv4();
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  next();
+};
+```
+
+Pass `correlationId` as a field in every `logger.info/error` call, every Bull job payload, and every audit trail event. This makes distributed tracing possible and debugging production failures practical.
+
+---
+
+### 16.4 Architecture Improvements (P1–P2)
+
+#### Improvement 8 — Parallel Document Extraction Within a Presentation (P1)
+
+**Current approach:** All four document extraction jobs are submitted to the same Bull queue and processed in FIFO order. For a single LC set uploaded all at once, all four documents are extracted sequentially, adding unnecessary latency.
+
+**Improved approach:** Group extraction jobs by presentation and process the four documents in a single presentation concurrently using `Promise.allSettled`:
+
+```javascript
+// documentProcessor.js — parallel extraction
+async extractAllDocuments(presentationDocuments) {
+  const results = await Promise.allSettled(
+    presentationDocuments.map(doc =>
+      this.extractDocument(doc.id, doc.documentType, doc.filePath)
+    )
+  );
+  // Handle partial failures — one failed document does not abort the others
+  return results.map((r, i) => ({
+    documentId: presentationDocuments[i].id,
+    success:    r.status === 'fulfilled',
+    data:       r.status === 'fulfilled' ? r.value : null,
+    error:      r.status === 'rejected'  ? r.reason.message : null,
+  }));
+}
+```
+
+**Impact:** Reduces extraction time from ~12 seconds (4 × 3s sequential) to ~4 seconds (4 documents in parallel). Directly reduces the path to the 60-second SLA.
+
+---
+
+#### Improvement 9 — Finding Deduplication Before Persistence (P2)
+
+**Current approach:** If the same LC set is resubmitted (or if the intent analysis job runs twice due to the race condition in Fix 3), duplicate findings are created in the database.
+
+**Fix:** Before persisting findings, check for existing findings with the same `presentationId`, `findingType`, and overlapping `affectedFields`. Only insert if no matching finding exists:
+
+```sql
+-- schema.sql — unique constraint
+ALTER TABLE findings
+  ADD CONSTRAINT findings_presentation_type_unique
+  UNIQUE (presentation_id, finding_type, affected_fields);
+```
+
+Combined with the advisory lock fix (Fix 3), this provides two independent deduplication layers.
+
+---
+
+#### Improvement 10 — Structured Logging with Request Context (P2)
+
+**Current approach:** `logger.js` uses Winston with a simple console format. Log entries don't include `correlationId`, `userId`, or `presentationId` as structured fields — they're embedded in the message string.
+
+**Improved approach:** Use Winston's child logger pattern to attach context to all log entries within a request scope:
+
+```javascript
+// middleware/requestLogger.js
+app.use((req, res, next) => {
+  req.log = logger.child({
+    correlationId: req.correlationId,
+    userId:        req.user?.id,
+    method:        req.method,
+    path:          req.path,
+  });
+  next();
+});
+```
+
+This makes log aggregation (Datadog, CloudWatch, ELK) query by `correlationId` or `userId` trivial without grep-based parsing.
+
+---
+
+### 16.5 Summary of Improvements by Priority
+
+| Priority | Improvement | Type | Impact |
+|---|---|---|---|
+| **P0** | Fix STP eligibility bug (moderate findings) | Correctness | Eliminates regulatory risk |
+| **P0** | Add presentation period deadline check | Correctness | Catches most common LC discrepancy |
+| **P0** | Fix duplicate analysis trigger race condition | Correctness | Prevents duplicate findings |
+| **P0** | Replace sentinel parsing with Tool Use | AI/API | Eliminates JSON parse failures |
+| **P1** | Enable Extended Thinking on Intent Engine | AI/API | Higher reasoning quality |
+| **P1** | Singleton agent instances (connection pooling) | Performance | Reduces API client overhead |
+| **P1** | Token usage tracking per presentation | Observability | Cost attribution and ROI tracking |
+| **P1** | JSON parse retry with recovery prompt | Reliability | Eliminates most extraction failures |
+| **P1** | Replace polling with Server-Sent Events | Architecture | Eliminates ~1,000 unnecessary requests/min |
+| **P1** | Correlation IDs across all layers | Observability | Makes debugging production issues practical |
+| **P1** | Parallel document extraction | Performance | Reduces extraction time by ~67% |
+| **P2** | Finding deduplication constraint | Correctness | Prevents duplicate DB records |
+| **P2** | Structured logging with child loggers | Observability | Enables log aggregation queries |
+
+---
+
+### 16.6 Updated ADRs
+
+**ADR-007 — Tool Use over Sentinel JSON Parsing**
+**Decision:** Use Anthropic API tool use (function calling) for all structured AI outputs instead of asking the model to embed JSON in free text.
+**Rationale:** Tool use produces validated, schema-conformant structured output without any text parsing. Eliminates the largest class of production failures in LLM-backed systems.
+**Applies to:** Intent Analysis Engine first; all four document agents in Phase 4 refactor.
+
+**ADR-008 — Extended Thinking for Intent Analysis Engine**
+**Decision:** Enable extended thinking on the Intent Analysis Engine with an 8,000 token budget, evaluated against benchmark corpus before production enablement.
+**Rationale:** The 6-dimension cross-document analysis is the most complex reasoning task in the system. Extended thinking gives the model a private scratchpad without token limit pressure, improving accuracy without increasing output length.
+**Gate:** Enable only after benchmark shows ≥3% detection rate improvement over standard chain-of-thought.
+
+**ADR-009 — SSE over Polling for Progress Updates**
+**Decision:** Implement Server-Sent Events for real-time validation progress rather than 3-second client polling.
+**Rationale:** SSE eliminates unnecessary API and database load while providing true real-time updates. Lower complexity than WebSockets (unidirectional, HTTP-native, no protocol upgrade).
+**Migration:** Polling remains as a fallback for clients that do not support SSE (legacy browsers).
+
+---
+
 ## Document History
 
 | Version | Date | Author | Changes |
 |---|---|---|---|
 | 1.0 | April 2026 | Engineering Team | Initial design document |
+| 1.1 | April 2026 | Engineering Team | Added Section 16: Design Improvements — 13 improvements across correctness, AI/API, reliability, and architecture; 3 new ADRs |
 
 ---
 
