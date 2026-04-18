@@ -81,6 +81,56 @@ router.post(
 );
 
 // ---------------------------------------------------------------------------
+// GET /api/validations/queue
+// Get review queue ordered by risk score descending
+// IMPORTANT: must be registered BEFORE /:presentationId to avoid route shadowing
+// ---------------------------------------------------------------------------
+router.get(
+  '/queue',
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const { status = 'completed', limit = 50, offset = 0 } = req.query;
+
+    const validStatuses = ['pending', 'processing', 'completed', 'failed'];
+    if (!validStatuses.includes(status)) {
+      throw createError(`Invalid status. Use: ${validStatuses.join(', ')}`, 400);
+    }
+
+    const countResult = await query(
+      `SELECT COUNT(*) AS total FROM lc_presentations WHERE status = $1`,
+      [status]
+    );
+
+    const result = await query(
+      `SELECT
+         lp.id, lp.lc_number, lp.client_name, lp.applicant, lp.beneficiary,
+         lp.status, lp.overall_risk_score, lp.stp_candidate,
+         lp.created_at, lp.updated_at,
+         COUNT(f.id) AS total_findings,
+         COUNT(f.id) FILTER (WHERE f.severity = 'critical' AND f.status = 'open') AS open_critical,
+         COUNT(f.id) FILTER (WHERE f.severity = 'moderate' AND f.status = 'open') AS open_moderate,
+         COUNT(d.id) AS document_count
+       FROM lc_presentations lp
+       LEFT JOIN findings f ON f.presentation_id = lp.id
+       LEFT JOIN documents d ON d.presentation_id = lp.id
+       WHERE lp.status = $1
+       GROUP BY lp.id
+       ORDER BY lp.overall_risk_score DESC NULLS LAST, lp.created_at ASC
+       LIMIT $2 OFFSET $3`,
+      [status, parseInt(limit, 10), parseInt(offset, 10)]
+    );
+
+    res.json({
+      success: true,
+      total:   parseInt(countResult.rows[0].total, 10),
+      limit:   parseInt(limit, 10),
+      offset:  parseInt(offset, 10),
+      queue:   result.rows,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
 // GET /api/validations/:presentationId
 // Get full validation result for a presentation
 // ---------------------------------------------------------------------------
@@ -310,54 +360,6 @@ router.post(
   })
 );
 
-// ---------------------------------------------------------------------------
-// GET /api/validations/queue
-// Get review queue ordered by risk score descending
-// ---------------------------------------------------------------------------
-router.get(
-  '/queue',
-  authenticate,
-  asyncHandler(async (req, res) => {
-    const { status = 'completed', limit = 50, offset = 0 } = req.query;
-
-    const validStatuses = ['pending', 'processing', 'completed', 'failed'];
-    if (!validStatuses.includes(status)) {
-      throw createError(`Invalid status. Use: ${validStatuses.join(', ')}`, 400);
-    }
-
-    const countResult = await query(
-      `SELECT COUNT(*) AS total FROM lc_presentations WHERE status = $1`,
-      [status]
-    );
-
-    const result = await query(
-      `SELECT
-         lp.id, lp.lc_number, lp.client_name, lp.applicant, lp.beneficiary,
-         lp.status, lp.overall_risk_score, lp.stp_candidate,
-         lp.created_at, lp.updated_at,
-         COUNT(f.id) AS total_findings,
-         COUNT(f.id) FILTER (WHERE f.severity = 'critical' AND f.status = 'open') AS open_critical,
-         COUNT(f.id) FILTER (WHERE f.severity = 'moderate' AND f.status = 'open') AS open_moderate,
-         COUNT(d.id) AS document_count
-       FROM lc_presentations lp
-       LEFT JOIN findings f ON f.presentation_id = lp.id
-       LEFT JOIN documents d ON d.presentation_id = lp.id
-       WHERE lp.status = $1
-       GROUP BY lp.id
-       ORDER BY lp.overall_risk_score DESC NULLS LAST, lp.created_at ASC
-       LIMIT $2 OFFSET $3`,
-      [status, parseInt(limit, 10), parseInt(offset, 10)]
-    );
-
-    res.json({
-      success: true,
-      total:   parseInt(countResult.rows[0].total, 10),
-      limit:   parseInt(limit, 10),
-      offset:  parseInt(offset, 10),
-      queue:   result.rows,
-    });
-  })
-);
 
 // ---------------------------------------------------------------------------
 // GET /api/validations/:presentationId/summary

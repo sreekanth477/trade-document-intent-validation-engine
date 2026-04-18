@@ -6,7 +6,12 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "migrate": "node src/db/migrate.js"
+    "migrate": "node src/db/migrate.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:e2e": "jest tests/e2e"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
@@ -28,6 +33,8 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "jest": "^30.3.0",
+    "nodemon": "^3.1.9",
+    "supertest": "^7.2.2"
   }
 }

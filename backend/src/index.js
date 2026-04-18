@@ -283,22 +283,27 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ---------------------------------------------------------------------------
-// Start server
+// Start server (only when run directly, not when require()'d by tests)
 // ---------------------------------------------------------------------------
-const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`Trade Document Intent Validation Engine API started`, {
-    port:        PORT,
-    environment: process.env.NODE_ENV || 'development',
-    uploadDir:   UPLOAD_DIR,
-    corsOrigins: allowedOrigins,
-    mockLLM:     process.env.USE_MOCK_LLM === 'true',
+let server;
+if (require.main === module) {
+  server = app.listen(PORT, '0.0.0.0', () => {
+    logger.info(`Trade Document Intent Validation Engine API started`, {
+      port:        PORT,
+      environment: process.env.NODE_ENV || 'development',
+      uploadDir:   UPLOAD_DIR,
+      corsOrigins: allowedOrigins,
+      mockLLM:     process.env.USE_MOCK_LLM === 'true',
+    });
+    initQueues();
   });
-  initQueues();
-});
 
-// Keep-alive and timeout settings
-server.keepAliveTimeout  = 65000;
-server.headersTimeout    = 66000;
-server.timeout           = 120000; // 2 min for LLM calls
+  // Keep-alive and timeout settings
+  server.keepAliveTimeout  = 65000;
+  server.headersTimeout    = 66000;
+  server.timeout           = 120000; // 2 min for LLM calls
+}
 
-module.exports = { app, server };
+// Export the raw express app so Supertest can bind its own ephemeral port
+module.exports = app;
+module.exports.server = server;
