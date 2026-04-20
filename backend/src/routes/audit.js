@@ -10,17 +10,45 @@ const { query }                     = require('../db/connection');
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
+// GET /api/audit/system/recent  (admin / compliance only)
+// Recent system-wide audit events for the admin dashboard.
+// IMPORTANT: registered BEFORE /:presentationId to prevent route shadowing.
+// ---------------------------------------------------------------------------
+router.get(
+  '/system/recent',
+  authenticate,
+  authorize('admin', 'compliance'),
+  asyncHandler(async (req, res) => {
+    const { limit = 50, offset = 0 } = req.query;
+
+    const events = await AuditService.getRecentEvents(
+      parseInt(limit, 10),
+      parseInt(offset, 10)
+    );
+
+    res.json({
+      success: true,
+      count:   events.length,
+      events,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
 // GET /api/audit/:presentationId
-// Get full audit trail for a presentation
+// Get full audit trail for a presentation.
+// Restricted to supervisor, compliance, and admin — audit trails contain
+// user IP addresses, override justifications, and PII-adjacent metadata.
 // ---------------------------------------------------------------------------
 router.get(
   '/:presentationId',
   authenticate,
+  authorize('supervisor', 'compliance', 'admin'),
   asyncHandler(async (req, res) => {
     const { presentationId } = req.params;
     const { limit = 500, offset = 0, eventType } = req.query;
 
-    // Verify presentation exists and user has access
+    // Verify presentation exists
     const presResult = await query(
       `SELECT id, lc_number, status FROM lc_presentations WHERE id = $1`,
       [presentationId]
@@ -54,12 +82,14 @@ router.get(
 
 // ---------------------------------------------------------------------------
 // GET /api/audit/:presentationId/export
-// Export full audit trail as structured JSON
+// Export full audit trail as structured JSON (regulatory-grade artefact).
+// Restricted to supervisor, compliance, and admin — export contains IP
+// addresses, user names, and full decision justifications.
 // ---------------------------------------------------------------------------
 router.get(
   '/:presentationId/export',
   authenticate,
-  authorize('checker', 'supervisor', 'compliance', 'admin'),
+  authorize('supervisor', 'compliance', 'admin'),
   asyncHandler(async (req, res) => {
     const { presentationId } = req.params;
 
@@ -88,11 +118,13 @@ router.get(
 
 // ---------------------------------------------------------------------------
 // GET /api/audit/:presentationId/statistics
-// Statistics breakdown by event type
+// Statistics breakdown by event type.
+// Restricted to supervisor, compliance, and admin (same as trail).
 // ---------------------------------------------------------------------------
 router.get(
   '/:presentationId/statistics',
   authenticate,
+  authorize('supervisor', 'compliance', 'admin'),
   asyncHandler(async (req, res) => {
     const { presentationId } = req.params;
 
@@ -101,30 +133,6 @@ router.get(
     res.json({
       success:    true,
       statistics: stats,
-    });
-  })
-);
-
-// ---------------------------------------------------------------------------
-// GET /api/audit/system/recent  (admin only)
-// Recent system-wide audit events for the admin dashboard
-// ---------------------------------------------------------------------------
-router.get(
-  '/system/recent',
-  authenticate,
-  authorize('admin', 'compliance'),
-  asyncHandler(async (req, res) => {
-    const { limit = 50, offset = 0 } = req.query;
-
-    const events = await AuditService.getRecentEvents(
-      parseInt(limit, 10),
-      parseInt(offset, 10)
-    );
-
-    res.json({
-      success: true,
-      count:   events.length,
-      events,
     });
   })
 );

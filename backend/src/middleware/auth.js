@@ -2,12 +2,21 @@
 
 const jwt    = require('jsonwebtoken');
 const logger = require('../utils/logger');
+const { query } = require('../db/connection');
 
 // ---------------------------------------------------------------------------
 // JWT Authentication Middleware
 // ---------------------------------------------------------------------------
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
+// Refuse to run with a missing or default secret — fail fast at module load.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET === 'change_me' || JWT_SECRET.length < 32) {
+  throw new Error(
+    '[SECURITY] JWT_SECRET must be set to a random string of at least 32 characters. ' +
+    'Set JWT_SECRET in your .env file. Never use the default value in any environment.'
+  );
+}
+
 const JWT_EXPIRY = process.env.JWT_EXPIRY  || '8h';
 
 /**
@@ -21,10 +30,12 @@ function generateToken(payload) {
 
 /**
  * Express middleware that validates the Bearer token in Authorization header.
+ * Re-checks is_active in the database on every request so that deactivated
+ * accounts are denied immediately — not only after their token expires.
  * Attaches the decoded payload to req.user on success.
- * Returns 401 on missing/invalid token.
+ * Returns 401 on missing/invalid/revoked token.
  */
-function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -36,11 +47,9 @@ function authenticate(req, res, next) {
 
   const token = authHeader.slice(7); // Strip "Bearer "
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    logger.debug('authenticate: token verified', { userId: decoded.id, role: decoded.role });
-    next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, error: 'Token has expired. Please log in again.' });
@@ -48,6 +57,29 @@ function authenticate(req, res, next) {
     logger.warn('authenticate: invalid token', { error: err.message, ip: req.ip });
     return res.status(401).json({ success: false, error: 'Invalid authentication token.' });
   }
+
+  // Re-validate account status on every request.
+  // This ensures deactivated accounts lose access immediately, not at token expiry.
+  try {
+    const result = await query(
+      `SELECT is_active, role FROM users WHERE id = $1`,
+      [decoded.id]
+    );
+    const user = result.rows[0];
+    if (!user || !user.is_active) {
+      logger.warn('authenticate: account inactive or not found', { userId: decoded.id, ip: req.ip });
+      return res.status(401).json({ success: false, error: 'Account has been deactivated. Please contact an administrator.' });
+    }
+    // Use the live role from DB (not the stale JWT payload) so role changes take effect immediately
+    decoded.role = user.role;
+  } catch (dbErr) {
+    logger.error('authenticate: DB check failed', { error: dbErr.message, userId: decoded.id });
+    return res.status(500).json({ success: false, error: 'Authentication check failed. Please try again.' });
+  }
+
+  req.user = decoded;
+  logger.debug('authenticate: token verified', { userId: decoded.id, role: decoded.role });
+  next();
 }
 
 /**
